@@ -1,0 +1,40 @@
+#######################################################################
+#######       PRE-PROCESSING Metabolomics RPOMETEO DATA         #######
+#######################################################################
+
+## By Manuel Ugidos and Carme Nuño
+
+# Raw data are available at MetaboLights, MTBLS1320.
+
+#### THIS PORTION OF THE SCRIPT IS RUN IN R USING A .R SCRIPT ####
+##################################################################
+
+## LIBRARIES TO USE
+library(NOISeq)
+
+## Read file containing raw data
+
+raw_met <- read.table(file = "metabolomics_raw.txt", sep = "\t")
+
+## Remove metabolites with all zero values
+
+zeros <- which(apply(raw_met_data, 1, sum) == 0)
+met_p1 <- raw_met_data[-zeros,]
+
+## Logaritmic transformation to equalize variance between metabolites
+
+met_p2 <- log2(met_p1)
+
+## Remove batch effect
+
+myfactors <- data.frame ("cond" = c(rep(c('t0', 't20', 't120'),8)),
+                         "SP" = rep(c(1,1,1,2,2,2),4),
+                         "strain" = c(rep("wt", 12), rep("mip", 12)),
+                         "CxS" = paste0(c(rep(c('t0', 't20', 't120'),8)),
+                                        c(rep("wt", 12), rep("mip", 12))))
+
+my_met <- readData(met_p2, factors = myfactors)
+met_cor <- ARSyNseq(my_met, factor = "CxS", batch = F, norm = "n", logtransf = TRUE)
+met_cor <- assayData(met_cor)$exprs
+
+write.table(met_cor, file = "Matabolomics.txt")

@@ -1,0 +1,94 @@
+#######################################################################
+#######         PRE-PROCESSING RNA-seq RPOMETEO DATA            #######
+#######################################################################
+
+## By Manuel Ugidos and Carme Nuño
+
+# Raw data are available at GEO, GSE135568
+
+####  THIS PORTION OF THE SCRIPT IS RUN IN HPC CLUSTER WITH A .SH SCRIPT ####
+#############################################################################
+
+## Step 1: Mapping files to reference genome
+
+######### VERSION OF THE GENOME USED:
+Reference Saccharomyces cerevisiae:
+  version: sacCer3
+  source: UCSC "https://genome.ucsc.edu"
+Genes: sacCer3.gtf
+
+######### VERSIONS OF THE SOFTWARE:
+samtools version 0.1.18
+TopHat  version 2.1.0
+
+tophat -o <outputdir> <sacCer3> <1_sample.fastq.gz> <2_sample.fastq.gz>
+
+## Step 2: Quantification of reads: using htseq
+htseq-count -a 20 -m union <sample>.sam sacCer3.gtf > <sample_counts.txt>
+# By merging all counts a RNAseqcounts.txt file was generated.
+
+#### THIS PORTION OF THE SCRIPT IS RUN IN R USING A .R SCRIPT ####
+##################################################################
+
+## LIBRARIES TO USE
+library(NOISeq)
+
+# Reading files -------------------------------------
+
+## Raw counts
+raw_data = read.delim("RNAseqcounts.txt", header = TRUE, as.is = TRUE, sep = "\t")
+
+## Gene lengths file
+gene_len = read.delim("sacCer3_geneLen.txt", header = FALSE, as.is = TRUE, sep = "\t")
+
+## Biotypes file
+biotypes <- read.table("sacCer3_biotypes.txt", header = F, sep = "\t")
+
+# QC using NOISeq ------------------------------------
+
+## Create object
+myfactor <- data.frame(Strain = c(rep("WT", 12), rep ("mip6", 12)),
+                       Temperature = rep(c(rep("30",4), rep("39", 8)),2),
+                       Time = rep(c(rep("0",4), rep("20",4), rep("120",4)),2),
+                       SP = rep(1:2, 12))
+myfactor <- data.frame (myfactor, paste(myfactor$Strain, myfactor$Time, sep = '_'))
+mydata <- readData(data = conteos_normal, factors = myfactor,
+                   biotype = biotypes, length = lengths)
+
+## Biotype detection
+mybiotype <- dat(mydata, k=0, type = "biodetection", factor = NULL)
+explo.plot(mybiotype,samples=c(1,2),cex.axis = 2)
+
+## Saturation plot
+mysaturation <- dat(mydata, k = 0, ndepth = 7, type = "saturation")
+explo.plot(mysaturation, toplot = 1, samples = 1:24)
+
+## RNA composition
+mycd<- dat(mydata, type = "cd", norm = F, refColumn = 1)
+explo.plot(mycd, samples = 1:12)
+
+## Length bias
+mylenbias <- dat(mydata, factor = "SxT", type = "lengthbias")
+explo.plot(mylenbias, samples = NULL, toplot="global")
+
+## Batch exploration
+myPCA <- dat(mydata, type = "PCA")
+explo.plot(myPCA, factor = "SP")
+
+## CPM
+mycounts <- dat(mydata, factor = NULL, type = "countsbio")
+explo.plot(mycounts, toplot=1, samples = NULL, plottype = "barplot")
+
+## Normalization TMM
+myTMM <- tmm(assayData(mydata)$exprs, long = lengths[,1])
+
+## Low counts
+myfilt <- filtered.data(myTMM, factor = myfactor$SxT, norm = T, method = 1, cpm = 1)
+
+## Batch correction
+mydata2 <- readData(data = myfilt, factors = myfactor)
+mydata_corr <- ARSyNseq(mydata2, factor = "SP", batch = T, norm = "n", logtransf = F,
+                        Variability = 0.99)
+
+write.table(assayData(mydata_corr)$exprs, row.names = T, col.names = T,
+            sep = "\t", file = "CountMatrixRNA-seq.txt")
