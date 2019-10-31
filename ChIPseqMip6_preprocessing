@@ -1,0 +1,255 @@
+#######################################################################
+#######         PRE-PROCESSING ChIP-seq RPOMETEO DATA           #######
+#######################################################################
+
+## By Manuel Ugidos and Carme Nuño
+
+# Raw data are available at GEO, GSE135568
+
+####  THIS PORTION OF THE SCRIPT IS RUN IN HPC CLUSTER WITH A .SH SCRIPT ####
+#############################################################################
+
+## Step 1: Mapping files to reference genome
+
+######### VERSION OF THE GENOME USED:
+Reference Saccharomyces cerevisiae:
+  version: sacCer3
+  source: UCSC "https://genome.ucsc.edu"
+Genes: sacCer3.gtf
+
+######### VERSIONS OF THE SOFTWARE
+samtools version 0.1.18
+bowtie2  version 2.1.0
+macs2 version 1.4.2
+bedtools version 2.25.0
+
+bowtie2 -x sacCer3 -U <sample>_reads.fastq.gz -S <sample>.sam
+
+## Step 2: Identification of peaks.
+# It was run using macs2.
+# For each time point, wild type and delta_mip6 peaks
+# were identified:
+macs2 callpeak -t <sample>.sam (all samples of the same time*strain factor) --nomodel --broad -f BAM -g 12100000
+
+# All peaks from H4K12ac samples were merged using bedtools
+bedtools merge -i <all files>.bed > mergedPeaks.union.bed
+# Then region file was converted to a gtf annotation file using a custom script.
+
+## Step 3: Quantification of peaks: using htseq
+htseq-count -a 20 -m union <sample>.sam mergedPeaks.union.gtf
+# By merging all count files a ChIPcounts.txt file was generated.
+
+## Step 4: Coverage per base using bedtools
+bedtools genomecov -d -ibam <sample>.bam -g sacCer3 <sample>.bigWig
+# bigWig files were separated in chromosomes creating 17 different folders,
+# in each folder the bigWig file of all the samples for a certain chromosome
+# were placed.
+
+
+#### THIS PORTION OF THE SCRIPT IS RUN IN R USING A .R SCRIPT ####
+##################################################################
+
+## LIBRARIES TO USE
+library(NOISeq)
+
+### Reading file with region raw counts -------------------------------------
+
+raw_data = read.delim("ChIPcounts.txt", header = TRUE, as.is = TRUE, sep = "\t")
+
+### QC using NOISeq ---------------------------------------------------------
+
+tag <- sapply(colnames(raw_data), function(x) {strsplit(x, "\\.")[[1]][1]})
+strain <- sapply(colnames(raw_data), function(x) {strsplit(x, "\\.")[[1]][2]})
+time <- sapply(colnames(raw_data), function(x) {strsplit(x, "\\.")[[1]][4]})
+batchSP <- c(rep(1:2,12)[-23],1,1,1,2,2,2,1,1,2,2,1,1,1,2,2,1,1,2,2)
+lengths <- read.table("lengths.txt", header = FALSE) # file with lengths of the peaks obtained with macs2
+
+## Create object
+factores_chip <- data.frame(strain, tag, time,
+                            batchSP, "SxT" = paste0(tag,strain,time))
+mychip <- readData(data = raw_data, factors = factores_chip,
+                   length = lengths)
+
+## RNA composition
+mycd<- dat(mychip, type = "cd", norm = F, refColumn = 1)
+explo.plot(mycd, samples = 1:12)
+
+## Length bias
+mylenbias <- dat(mychip, factor = "SxT", type = "lengthbias")
+explo.plot(mylenbias, samples = NULL, toplot="global")
+
+## Batch exploration
+myPCA <- dat(mychip, type = "PCA", norm = F)
+explo.plot(myPCA, factor = "batchSP")
+
+## CPM
+mycounts <- dat(mychip, factor = NULL, type = "countsbio")
+explo.plot(mycounts, toplot=1, samples = NULL, plottype = "barplot")
+
+## Library size correction
+mychipTMM <- tmm(assayData(mychip)$exprs,
+                 long = lengths,
+                 lc = 1)
+
+write.table((mychipTMM), row.names = T, col.names = T,
+             sep = "\t", file = "CountMatrixChIP-seq.txt")
+
+## replicability
+pairs(log2(mychipTMM)[,c(27,32,38,39)], panel= function(x,y,...){
+        points(x,y, pch = 19);
+        abline(0,1,col="indianred")})
+
+### Correcting K12 samples with H4 samples ----------------------------------
+matchnames <- paste0(factores_chip$strain, factores_chip$time)
+
+## H4 average counts
+mediasH4 <- sapply(unique(factores_chip$SxT)[1:6], function(x) {
+  aux <- (mychipTMM[,which(factores_chip$SxT==x)])
+  apply(aux, 1, mean)
+})
+colnames(mediasH4) <- unique(matchnames)
+
+## Normalized K12 samples
+normK12 <- NULL
+auxK12 <- sapply(colnames(mediasH4), function(x) {
+  aux <- (mychipTMM[,24:42][,which(matchnames[24:42]==x),drop = FALSE])
+  apply(aux, 2, function(y) {y/(mediasH4[,x])})
+})
+for ( i in seq_along(auxK12)) {
+  normK12 <- cbind(normK12,auxK12[[i]])
+}
+
+
+## Analysis of coverage per base metrices -------------------------------
+
+# Four files were created from the sacCer3.gtf and the .bigWig files
+
+### Creating information files of genes and TSS locations ---------------
+gff <- read.csv("saccer3.gtf", skip = 5, header = F, sep = "\t")
+
+## Select pos genes
+gff <- gff[which(gff$V7=="+"),]
+genes <- sapply(gff$V9, function(x) {
+  strsplit(strsplit(toString(x), ";")[[1]][1], " ")[[1]][2]
+})
+gff <- data.frame(gff, genes)
+
+## Obtain the coordinates of each gene
+{gene_regions_pos <- (vapply(unique(genes), function(x) {
+  aux <- gff[which(gff$genes==x),]
+  st <- min((aux[which(aux$V3=="gene"),4:5]))
+  sp <- max((aux[which(aux$V3=="gene"),4:5]))
+  chr <- toString(aux[which(aux$V3=="gene"),1])
+  c(chr, max(st-100,0), sp+100)
+}, FUN.VALUE = c(chr= "", start = 0, stop = 0)))
+  gene_regions_pos <- t(gene_regions_pos)}
+
+## Obtain the coordinates of the TSS
+{tss_regions_pos <- (vapply(unique(genes), function(x) {
+  aux <- gff[which(gff$genes==x),]
+  st <- min((aux[which(aux$V3=="gene"),4:5]))
+  chr <- toString(aux[which(aux$V3=="gene"),1])
+  #c(chr, st-150, min(sp+150, seq_lim[chr]))
+  c(chr, max(st-100,0), st+100)
+}, FUN.VALUE = c(chr= "", start = 0, stop = 0)))
+  tss_regions_pos <- t(tss_regions_pos)}
+
+# Changing "+" to "-" in line 131, we can obtain the coordinates for genes
+# in the negative strand, so we can obtain: gene_regions_anti and tss_regions_anti
+# Taking into account that TSS in negative stranded genes is the sp position.
+
+## Analysis of the metagene ------------------------------------------------
+
+## Open bigWig files
+
+filelist <- list.files("bigWigfiles/chr1/", pattern = "*.txt")
+names <- sapply(filelist, function(x) strsplit(x,"\\.")[[1]][1])
+BW <- NULL
+for ( j in 1:17) {
+  BWaux <- NULL
+  for ( i in filelist) {
+    bw <- read.csv (paste0("bigWigfiles/chr",j,"/",i), sep = "\t", header = F)
+    BWaux <- cbind(BWaux, bw[,3])
+  }
+  BW <- rbind(BW, BWaux)
+}
+bw <- NOISeq::tmm(BW)
+
+text <- c()
+for ( i in 1:17) {
+  if (i == 1) {
+    text <- c(text,paste0("chr I: ", 1:lenchr[i]))
+  } else {
+    text <- c(text,paste0(chr[i],": ", 1:lenchr[i]))
+  }
+}
+rownames(bw) <- text
+colnames(bw) <- c("H4_mip6_30", "H4_mip6_39_120", "H4_mip6_39_20",
+                  "H4_WT_30", "H4_WT_39_120", "H4_WT_39_20",
+                  "H4K12_mip6_30", "H4K12_mip6_39_120", "H4K12_mip6_39_20",
+                  "H4K12_WT_30", "H4K12_WT_39_120", "H4K12_WT_39_20")
+
+write.table(bw, row.names = T, col.names = T,
+            sep = "\t", file = "CoveragePerBaseChIP-seq.txt")
+
+## Compute metagene
+
+AVpos <- matrix(0, nrow = 12, ncol = 201)
+stepaux <- c()
+for ( c in unique(gene_regions_pos[,1])) {
+
+  chrindex <- which(names(lenchr)==c)
+
+  if (chrindex == 1) {
+    bw2 <- bw[1:(sum(lenchr[1:chrindex])),]
+  } else {
+    bw2 <- bw[(sum(lenchr[1:max(chrindex-1,1)])):(sum(lenchr[1:chrindex])),]
+  }
+
+  for ( j in 1:dim(z[which(z[,1]==c),,drop=FALSE])[1]) {
+    x <-  z[which(z[,1]==c),,drop=FALSE][j,]
+    AVaux <- NULL
+    cont.init <- as.numeric(x[2])
+    step <- round((as.numeric(x[3])-as.numeric(x[2]))/200)
+    #BW <- 2**(normalizeMedianValues(log2(BW+1)))
+    stepaux <- c(stepaux, step)
+    for ( i in 0:200) {
+        ini <- cont.init
+        end <- cont.init + step
+
+        aux <- bw2[ini:end,]
+        aux2 <- apply(aux,2,mean)
+        AVaux <- cbind(AVaux, aux2)
+
+        cont.init <- cont.init + step
+    }
+    rownames(AVaux) <- names
+    AVpos <- AVpos + AVaux
+  }
+}
+# Changing "pos" to "anti", we get the coverage for genes in the negative strand
+# The result of the genes in the negative strand must be turn around in order to be
+# compare with the positive stranded genes.
+AVanti2pos <- t(apply(AVanti, 1, function(x) {
+  r <- c()
+  for ( i in seq(201,1,-1)) {
+    r <- c(r, x[i])
+  }
+  r
+}))
+
+# Total result
+AV <- AVpos + AVanti2pos
+
+## Plot
+tocolors <- rep(c("darkolivegreen", "lightsalmon3", "lightblue4",
+                  "darkolivegreen1", "lightsalmon", "lightblue"),2)
+tolty <- c(rep(5,6), rep(1,6))
+plot(AV[1,], type = "n", ylim = c(200,800), col = tocolors[1],
+     lty = 1, lwd = 3, cex.axis = 2, cex.main = 2, ylab = "", xlab = "")
+for ( i in c(1:12)) {
+  lines(AV[i,], col = tocolors[i], lty = tolty[i], lwd = 3)
+}
+
+# With the same code and by changing "gene_regions_pos" to "tss_regions_pos"
+# the coverage across TSS region exclusively can be obtained.
